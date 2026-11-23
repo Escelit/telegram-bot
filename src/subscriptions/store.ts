@@ -9,13 +9,24 @@ export interface Ref {
   id: string;
 }
 
-export interface StoreFile {
-  version: number;
-  // chatId -> array of ref strings (e.g. "market:123")
+/** Version 1 on-disk layout: no network identity. */
+interface StoreFileV1 {
+  version: 1;
   follows: Record<string, string[]>;
 }
 
-export const STORE_VERSION = 1;
+/** Version 2 on-disk layout: includes the Stellar network passphrase. */
+interface StoreFileV2 {
+  version: 2;
+  network: string;
+  follows: Record<string, string[]>;
+}
+
+/** Union of all recognised on-disk shapes. */
+export type StoreFile = StoreFileV1 | StoreFileV2;
+
+/** Current store version written by this code. */
+export const STORE_VERSION = 2;
 
 export const DEFAULT_MAX_PER_CHAT = 50;
 
@@ -66,6 +77,11 @@ export interface FollowStoreFs {
  * Configuration for `FollowStore`. Corrupt or unreadable files are moved to
  * `${filePath}.corrupt.<timestamp>`; if quarantine `rename` fails, source bytes
  * are retained in place (never unlinked) and a redacted `FollowStoreError` is thrown.
+ *
+ * When `network` is supplied, the store records it in every new file (version 2)
+ * and refuses to open an existing file that was written for a different network.
+ * An existing version-1 file (no network) must be migrated explicitly via
+ * {@link FollowStore.migrateToNetwork} before the network check can be enforced.
  */
 export interface FollowStoreOptions {
   filePath: string;
@@ -74,12 +90,50 @@ export interface FollowStoreOptions {
   // Aliases for API compatibility.
   maxFollowsPerChat?: number;
   maxTotalEntries?: number;
+  /**
+   * Stellar network passphrase (or any stable network identifier) that this
+   * store is bound to. When set:
+   * - new files are written at version 2 with this value
+   * - existing version-2 files must carry the same value or the store throws
+   * - existing version-1 files (no network field) trigger a `FollowStoreError`
+   *   until `migrateToNetwork()` is called
+   *
+   * When absent, the store operates without network enforcement (backwards
+   * compatible with callers that do not have a passphrase available).
+   */
+  network?: string | undefined;
   fs?: Partial<FollowStoreFs>;
   now?: () => number;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Canonical unsigned integer: `0` or a sequence of 1–20 digits with no
+ * leading zero, no sign prefix, no decimal point, and no exponent.
+ *
+ * The upper bound of 20 digits covers u64::MAX (18_446_744_073_709_551_615).
+ */
+const CANONICAL_UINT_RE = /^(0|[1-9]\d{0,19})$/;
+
+/**
+ * An id that "looks numeric" must be a canonical unsigned integer.
+ *
+ * "Looks numeric" is any id that:
+ *   - starts with a digit, sign (`+`/`-`), decimal point, or `0x`/`0X`, OR
+ *   - parses as a finite JavaScript number (catches exponent forms like `1e5`).
+ *
+ * Contract address strkeys (e.g. `CABC…`) and human-readable slugs that
+ * contain no digit-like start characters pass through unchecked.
+ */
+function isCanonicalNumericId(id: string): boolean {
+  const looksNumeric =
+    /^[+\-0-9.]/.test(id) ||
+    (id.length > 0 && Number.isFinite(Number(id)));
+  if (!looksNumeric) return true;
+  return CANONICAL_UINT_RE.test(id);
 }
 
 export function parseRef(ref: string): Ref | null {
@@ -93,6 +147,9 @@ export function parseRef(ref: string): Ref | null {
   // Reject whitespace, control characters and a second ':' in id, so a ref
   // always splits into exactly one kind and one id.
   if (/[\s\u0000-\u001F:]/.test(id)) return null;
+  // Reject non-canonical numeric ids: signed, exponent, leading-zero, or
+  // oversized decimal strings are all rejected here.
+  if (!isCanonicalNumericId(id)) return null;
   return { kind, id };
 }
 
@@ -100,8 +157,11 @@ export function formatRef(kind: RefKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function emptyStore(): StoreFile {
-  return { version: STORE_VERSION, follows: {} };
+function emptyStore(network?: string): StoreFile {
+  if (network !== undefined) {
+    return { version: 2, network, follows: {} };
+  }
+  return { version: 1, follows: {} };
 }
 
 function normalizeRefList(chatId: string, list: unknown, context: string): string[] {
@@ -136,7 +196,7 @@ function validateStoreFile(data: unknown): StoreFile {
   for (const [chatId, list] of Object.entries(data.follows as Record<string, unknown>)) {
     follows[chatId] = normalizeRefList(chatId, list, "follows");
   }
-  return { version: STORE_VERSION, follows };
+  throw new FollowStoreError(`unsupported store version: ${String(version)}`);
 }
 
 function quarantineFile(
@@ -163,6 +223,7 @@ export class FollowStore {
   private readonly filePath: string;
   private readonly maxPerChat: number;
   private readonly maxTotal: number;
+  private readonly network: string | undefined;
   private readonly readFileSync: FollowStoreFs["readFileSync"];
   private readonly renameSync: FollowStoreFs["renameSync"];
   private readonly now: () => number;
@@ -180,6 +241,7 @@ export class FollowStore {
     this.maxPerChat =
       options.maxPerChat ?? options.maxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
     this.maxTotal = options.maxTotal ?? options.maxTotalEntries ?? DEFAULT_MAX_TOTAL;
+    this.network = options.network;
     this.readFileSync =
       options.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc));
     this.renameSync = options.fs?.renameSync ?? fs.renameSync;
@@ -204,31 +266,55 @@ export class FollowStore {
 
   private read(): StoreFile {
     if (!fs.existsSync(this.filePath)) {
-      return emptyStore();
+      return emptyStore(this.network);
     }
     let raw: string;
     try {
       raw = this.readFileSync(this.filePath, "utf8");
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
     if (raw.trim() === "") {
-      return emptyStore();
+      return emptyStore(this.network);
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
+    let data: StoreFile;
     try {
-      return validateStoreFile(parsed);
+      data = validateStoreFile(parsed);
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
+
+    // ── Network enforcement ───────────────────────────────────────────────────
+    if (this.network !== undefined) {
+      if (data.version === 1) {
+        // Version-1 files predate network identity. Refuse to use them until
+        // the operator explicitly migrates via migrateToNetwork(). This prevents
+        // a file created on mainnet from being silently reused on testnet after
+        // the operator adds a STELLAR_NETWORK_PASSPHRASE.
+        throw new FollowStoreError(
+          `follow store at ${redactText(this.filePath)} has no network identity (version 1). ` +
+            `Call migrateToNetwork() to bind it to the configured network before use, ` +
+            `or delete the file to start fresh.`,
+        );
+      }
+      if (data.version === 2 && data.network !== this.network) {
+        throw new FollowStoreError(
+          `follow store at ${redactText(this.filePath)} is bound to a different network. ` +
+            `Delete the file or use a separate filePath for each network.`,
+        );
+      }
+    }
+
+    return data;
   }
 
   private write(data: StoreFile): void {
